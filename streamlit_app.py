@@ -5,7 +5,8 @@ The same pipeline as notebook_llm.ipynb, but in the browser:
   1. take a photo of the INTERVIEWEE with the camera (it is kept in memory only, never saved to disk);
   2. the REPORTERS come from the repository: data/reporter_enrolment/<Name>/<photo>;
   3. start the live interview: every camera frame is processed and sent back with the interviewee masked
-     and every face named. Tick "Record" to save the processed interview as an MP4 you can download.
+     and every face named. With "Record" on, the processed interview -- with its sound, from the
+     microphone -- is saved as an MP4 you can download.
 
 Run it on your own computer, from this folder:
     pip install -r requirements.txt
@@ -30,13 +31,15 @@ import mediapipe as mp
 import numpy as np
 import streamlit as st
 from scipy import spatial
-from streamlit_webrtc import VideoProcessorBase, WebRtcMode, get_cloudflare_ice_servers, webrtc_streamer
+from streamlit_webrtc import (VideoProcessorBase, WebRtcMode, create_audio_sink_track, get_cloudflare_ice_servers,
+                              webrtc_streamer)
 
 # ---- files (all paths are relative to this script, so the app runs from any folder)
 APP_FOLDER = os.path.dirname(os.path.abspath(__file__))
 REPORTER_DIR = os.path.join(APP_FOLDER, "data", "reporter_enrolment")
 MODEL_PATH = os.path.join(APP_FOLDER, "models", "mobilefacenet", "w600k_mbf.onnx")
 RECORDING_DIR = os.path.join(APP_FOLDER, "recordings")    # one MP4 per browser session
+SOUND_RATE = 48000               # the browser's sound arrives as 48,000 samples per second
 
 # ---- detection (MediaPipe) and recognition (MobileFaceNet) -- the same values as the notebook
 MODEL_SELECTION = 1              # MediaPipe: 1 = full-range model (faces up to ~5 m), 0 = short-range (~2 m)
@@ -45,18 +48,18 @@ FACE_SIZE = 112                  # every face crop is resized to 112 x 112 for M
 THRESHOLD = 0.60                 # angular-similarity threshold from Week 7
 
 # ---- following faces from frame to frame
-IOU_SAME_FACE = 0.4              # detected box vs a box from the previous frame: IoU above this = same face
-TRACK_MIN_SCORE = 0.4            # template-matching score below this = the face is lost
+IOU_SAME_FACE = 0.3              # detected box vs a box from the previous frame: IoU above this = same face
+TRACK_MIN_SCORE = 0.3            # template-matching score below this = the face is lost
 SEARCH_MARGIN = 0.5              # search around the last box, half a box wider on every side
 SCALES = [0.95, 1.0, 1.05]       # template sizes tried in every frame
-MERGE_IOU = 0.5                  # two boxes overlapping more than this are the same face
+MERGE_IOU = 0.4                  # two boxes overlapping more than this are the same face
 UNSEEN_SECONDS = {"interviewee": 10, "reporter": 3, "stranger": 1}   # follow an undetected face this long
 
 # ---- masking and labels
 INTERVIEWEE_ALIAS = "Mr. X"      # the name shown for the interviewee
 MASK_STRANGERS = True            # also hide faces that match nobody
-FACE_RECT_WIDTH = 1.2            # face rectangle (crop and mask): 120% of MediaPipe's box width
-FACE_RECT_FOREHEAD = 0.3         # face rectangle: raise the top by 30% of the box height (forehead)
+FACE_RECT_WIDTH = 1.3            # face rectangle (crop and mask): 120% of MediaPipe's box width
+FACE_RECT_FOREHEAD = 0.4         # face rectangle: raise the top by 30% of the box height (forehead)
 
 # name colours in BGR order: green, orange, red
 COLOURS = {"reporter": (0, 170, 0), "interviewee": (0, 140, 255), "stranger": (0, 0, 230)}
@@ -247,6 +250,55 @@ def iou(box_a, box_b):
     return intersection / union
 
 
+def move_face(face, box, now):
+    """A detected box shows this face: move the face's box there (its name stays the same)."""
+    face["box"] = box
+    face["found"] = True
+    face["matched"] = True                        # a detected box has matched this face in this frame
+    face["last_seen"] = now
+
+
+def both_people_labelled(faces):
+    """True when a reporter AND the interviewee are both among the faces we follow."""
+    reporter_found = False
+    interviewee_found = False
+    for face in faces:
+        if face["role"] == "reporter":
+            reporter_found = True
+        if face["role"] == "interviewee":
+            interviewee_found = True
+    return reporter_found and interviewee_found
+
+
+def find_person_nearby(box, faces):
+    """The reporter or interviewee that no detected box has matched in this frame, within one face-width
+    of this box -- the same person, who moved too fast for the IoU gate. Returns that face, or None."""
+    x, y, w, h = box
+    box_center_x = x + w // 2
+    box_center_y = y + h // 2
+    nearest_face = None
+    nearest_distance = w                          # only look within one face-width
+    for face in faces:
+        if face["role"] == "stranger" or face["matched"]:
+            continue
+        fx, fy, fw, fh = face["box"]
+        dx = (fx + fw // 2) - box_center_x
+        dy = (fy + fh // 2) - box_center_y
+        distance = (dx * dx + dy * dy) ** 0.5
+        if distance < nearest_distance:
+            nearest_face = face
+            nearest_distance = distance
+    return nearest_face
+
+
+def find_face_with_label(label, faces):
+    """The face that already carries this name (e.g. "Mr. X"), or None."""
+    for face in faces:
+        if face["label"] == label:
+            return face
+    return None
+
+
 def merge_duplicates(faces):
     """One face, one box: if two boxes overlap by more than MERGE_IOU, keep the older face's label
     and give it the newer box. The list is in the order the faces appeared, so earlier = older."""
@@ -321,58 +373,71 @@ def draw_label(frame, face):
 
 
 # =====================================================================================================
-# The live video: streamlit-webrtc sends every camera frame to InterviewProcessor.recv(),
-# which runs the notebook's seven steps and returns the masked, labelled frame to the browser.
-# If a recording path is given, every processed frame is also written to an MP4 file -- starting with the
-# FIRST processed frame, so the recording never contains the seconds while the camera is still connecting.
+# The recording: the processed video AND the sound, in one MP4 file.
+# The video frames are written by the video thread. The sound arrives on a different thread, where it is only
+# put in a waiting list; the video thread writes it too, so only one thread ever writes to the file.
+# The recording starts with the FIRST processed video frame, so it never contains the seconds while the camera
+# is still connecting, and the file gets its final name only when it is complete.
 # =====================================================================================================
 
-class InterviewProcessor(VideoProcessorBase):
+class InterviewRecorder:
 
-    def __init__(self, gallery, recording_path):
-        self.gallery = gallery                    # the reporters, plus the interviewee from the photo
-        self.face_detector = new_face_detector()  # this thread's own copy of the two models
-        self.face_model = new_face_model()
-        self.faces = []                           # every face we are following (one dictionary per face)
-        self.count_recognitions = 0
-
-        # ---- the recording (None = do not record)
-        self.recording_path = recording_path
-        self.video_file = None                    # opened on the first processed frame
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()              # the video thread and the sound thread share this object
+        self.recording = False                    # True between begin() and finish()
+        self.with_sound = False
+        self.video_file = None                    # opened on the first processed video frame
         self.video_stream = None
-        self.recording_start = 0.0
+        self.sound_stream = None
+        self.start_time = 0.0
         self.last_timestamp = -1
-        self.lock = threading.Lock()              # recv() and on_ended() run in different threads
+        self.waiting_sound = []                   # sound frames not written yet: (frame, time it arrived)
+        self.sound_start = None                   # where the sound starts, in samples after the recording started
+        self.sound_samples = 0                    # how many sound samples have been written
 
-    def recv(self, frame):
-        image = frame.to_ndarray(format="bgr24")  # the camera frame as an OpenCV (BGR) image
-        image = self.process(image)
-        self.record_frame(image)
-        return av.VideoFrame.from_ndarray(image, format="bgr24")
-
-    def record_frame(self, image):
-        """Add one processed frame to the MP4. The file is opened on the very first processed frame."""
-        if self.recording_path is None:
-            return
+    def begin(self, with_sound):
+        """A new interview: get ready to record (the file opens on the first processed video frame)."""
         with self.lock:
+            self.recording = True
+            self.with_sound = with_sound
+            self.video_file = None
+            self.last_timestamp = -1
+            self.waiting_sound = []
+            self.sound_start = None
+            self.sound_samples = 0
+
+    def add_sound(self, frame):
+        """Called for every sound frame from the microphone: keep it until the video thread writes it."""
+        with self.lock:
+            if self.recording and self.with_sound and self.video_file is not None:
+                self.waiting_sound.append((frame, time.time()))
+
+    def add_video_frame(self, image):
+        """Add one processed video frame (and any sound that arrived meanwhile) to the MP4."""
+        with self.lock:
+            if not self.recording:
+                return
             height, width = image.shape[:2]
             width = width - width % 2             # the H.264 video format needs an even width and height
             height = height - height % 2
 
             if self.video_file is None:
-                # the FIRST processed frame: start the recording now
-                # (written to a temporary name, and renamed only when it is complete -- see on_ended)
-                self.video_file = av.open(self.recording_path + ".tmp", mode="w", format="mp4")
+                # the FIRST processed frame: start the recording now, under a temporary name
+                self.video_file = av.open(self.path + ".tmp", mode="w", format="mp4")
                 self.video_stream = self.video_file.add_stream("libx264", rate=30)
                 self.video_stream.width = width
                 self.video_stream.height = height
                 self.video_stream.pix_fmt = "yuv420p"
                 self.video_stream.codec_context.time_base = Fraction(1, 1000)   # timestamps in milliseconds
-                self.recording_start = time.time()
+                if self.with_sound:
+                    self.sound_stream = self.video_file.add_stream("aac", rate=SOUND_RATE)
+                    self.sound_stream.layout = "stereo"
+                self.start_time = time.time()
 
             # each frame is stamped with the real time since the recording started,
             # because live video has no fixed frame rate
-            timestamp = int((time.time() - self.recording_start) * 1000)
+            timestamp = int((time.time() - self.start_time) * 1000)
             if timestamp <= self.last_timestamp:
                 timestamp = self.last_timestamp + 1        # every frame needs a later timestamp than the last
             self.last_timestamp = timestamp
@@ -383,16 +448,71 @@ class InterviewProcessor(VideoProcessorBase):
             for packet in self.video_stream.encode(video_frame):
                 self.video_file.mux(packet)
 
-    def on_ended(self):
-        """Called by streamlit-webrtc when the interview stops (STOP pressed): finish the MP4 file."""
-        with self.lock:
-            if self.video_file is None:
-                return                            # nothing was recorded
-            for packet in self.video_stream.encode():  # flush the frames still inside the encoder
+            self.write_waiting_sound()
+
+    def write_waiting_sound(self):
+        """Write the sound frames in the waiting list (the lock is already held)."""
+        if not self.with_sound:
+            return
+        for frame, arrival_time in self.waiting_sound:
+            if self.sound_start is None:
+                # the first sound frame: it starts at the moment it arrived, after the recording started
+                self.sound_start = int((arrival_time - self.start_time) * SOUND_RATE)
+            # after that, the sound runs on without gaps: each frame starts where the last one ended
+            frame.pts = self.sound_start + self.sound_samples
+            frame.time_base = Fraction(1, SOUND_RATE)
+            self.sound_samples = self.sound_samples + frame.samples
+            for packet in self.sound_stream.encode(frame):
                 self.video_file.mux(packet)
+        self.waiting_sound = []
+
+    def finish(self):
+        """The interview has stopped: finish the MP4 file and give it its final name."""
+        with self.lock:
+            if not self.recording:
+                return
+            self.recording = False
+            if self.video_file is None:
+                return                            # no frame was processed, so there is nothing to save
+            self.write_waiting_sound()
+            for packet in self.video_stream.encode():  # flush the frames still inside the encoders
+                self.video_file.mux(packet)
+            if self.with_sound:
+                for packet in self.sound_stream.encode():
+                    self.video_file.mux(packet)
             self.video_file.close()
             self.video_file = None
-            os.replace(self.recording_path + ".tmp", self.recording_path)   # the finished recording
+            os.replace(self.path + ".tmp", self.path)    # the finished recording
+
+
+# =====================================================================================================
+# The live video: streamlit-webrtc sends every camera frame to InterviewProcessor.recv(),
+# which runs the notebook's seven steps and returns the masked, labelled frame to the browser.
+# =====================================================================================================
+
+class InterviewProcessor(VideoProcessorBase):
+
+    def __init__(self, gallery, recorder, with_sound):
+        self.gallery = gallery                    # the reporters, plus the interviewee from the photo
+        self.face_detector = new_face_detector()  # this thread's own copy of the two models
+        self.face_model = new_face_model()
+        self.faces = []                           # every face we are following (one dictionary per face)
+        self.count_recognitions = 0
+        self.recorder = recorder                  # None = do not record
+        if self.recorder is not None:
+            self.recorder.begin(with_sound)       # a new interview starts
+
+    def recv(self, frame):
+        image = frame.to_ndarray(format="bgr24")  # the camera frame as an OpenCV (BGR) image
+        image = self.process(image)
+        if self.recorder is not None:
+            self.recorder.add_video_frame(image)
+        return av.VideoFrame.from_ndarray(image, format="bgr24")
+
+    def on_ended(self):
+        """Called by streamlit-webrtc when the interview stops: finish the recording."""
+        if self.recorder is not None:
+            self.recorder.finish()
 
     def process(self, frame):
         """The notebook's render loop for ONE frame (steps 1 to 7). Returns the processed frame."""
@@ -400,9 +520,10 @@ class InterviewProcessor(VideoProcessorBase):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         faces = self.faces
 
-        # ---- STEP 1: remember where every face was in the previous frame
+        # ---- STEP 1: remember where every face was in the previous frame (no detected box has matched it yet)
         for face in faces:
             face["previous_box"] = face["box"]
+            face["matched"] = False
 
         # ---- STEP 2: FOLLOW every face with its rolling template
         for face in faces:
@@ -413,19 +534,8 @@ class InterviewProcessor(VideoProcessorBase):
             else:
                 face["found"] = False             # lost -- unless a detected box rescues it in step 3
 
-        # ---- STEP 3: DETECT faces. For each box: an old face or a new face?
-        # are the reporter AND the interviewee both being followed? then nobody new is recognised
-        reporter_in_frame = False
-        interviewee_in_frame = False
-        for face in faces:
-            if face["role"] == "reporter":
-                reporter_in_frame = True
-            if face["role"] == "interviewee":
-                interviewee_in_frame = True
-        both_in_frame = reporter_in_frame and interviewee_in_frame
-
+        # ---- STEP 3: DETECT faces. For each box: an old face, a labelled person who moved fast, or a new face?
         detected_boxes = detect_faces(frame, self.face_detector)
-        new_faces = []
         for box in detected_boxes:
             # which face from the previous frame does this box overlap the most?
             best_iou = 0.0
@@ -438,21 +548,35 @@ class InterviewProcessor(VideoProcessorBase):
 
             if best_iou > IOU_SAME_FACE:
                 # an OLD face: do not recognise it again, just move its box onto the detected box
-                best_face["box"] = box
-                best_face["found"] = True
-                best_face["last_seen"] = now
-            elif both_in_frame:
-                pass                              # a NEW box, but both people are already labelled: skip it
-            else:
-                # a NEW face: crop it and recognise it, 1:N then 1:1
-                role, label, score = recognise(crop_face(frame, box), self.gallery, self.face_model)
-                self.count_recognitions = self.count_recognitions + 1
-                new_face = {"box": box, "role": role, "label": label, "score": score,
-                            "found": True, "last_seen": now}
-                new_faces.append(new_face)
+                move_face(best_face, box, now)
+                continue
 
-        for new_face in new_faces:
-            faces.append(new_face)
+            # not an old face -- but maybe the reporter or interviewee, who moved too fast for the IoU gate
+            person = find_person_nearby(box, faces)
+            if person is not None:
+                move_face(person, box, now)       # the same person: no need to recognise them again
+                continue
+
+            # the reporter AND the interviewee are both labelled: never use the face model for anyone else
+            if both_people_labelled(faces):
+                continue
+
+            # a NEW face: crop it and recognise it, 1:N then 1:1
+            role, label, score = recognise(crop_face(frame, box), self.gallery, self.face_model)
+            self.count_recognitions = self.count_recognitions + 1
+
+            # one face per person: is someone with this name already on screen?
+            holder = None
+            if role != "stranger":
+                holder = find_face_with_label(label, faces)
+            if holder is not None and not holder["matched"]:
+                move_face(holder, box, now)       # their old box had drifted away: move it here
+                continue
+            if holder is not None:
+                role = "stranger"                 # that person is already on screen: this is someone else
+                label = "Stranger"
+            faces.append({"box": box, "previous_box": box, "role": role, "label": label, "score": score,
+                          "found": True, "matched": True, "last_seen": now})
 
         # ---- STEP 4: FORGET faces that were lost, or that no detected box has matched for too long
         kept_faces = []
@@ -640,22 +764,38 @@ def live_interview(gallery, rtc_configuration):
         st.markdown("Names on screen: :green[**reporter**] · :orange[**" + INTERVIEWEE_ALIAS + "** (masked)] · "
                     ":red[**Stranger** (masked)]")
         record = st.toggle("Record this interview", value=True)
+        with_sound = False
+        if record:
+            with_sound = st.toggle("Record the sound too (microphone)", value=True)
 
         # every browser session records to its own file, so two people never overwrite each other's video
         if "session_id" not in st.session_state:
             st.session_state["session_id"] = uuid.uuid4().hex[:8]
         os.makedirs(RECORDING_DIR, exist_ok=True)
         recording_path = os.path.join(RECORDING_DIR, "interview_" + st.session_state["session_id"] + ".mp4")
+
+        # one recorder per browser session: the video thread and the sound thread both write to it
+        if "recorder" not in st.session_state:
+            st.session_state["recorder"] = InterviewRecorder(recording_path)
+        recorder = st.session_state["recorder"]
         if not record:
+            recorder = None
             recording_path = None
+
+        # the microphone's sound goes to the recorder only -- it is not played back, so there is no echo
+        sound_sink = None
+        if with_sound:
+            sound_sink = create_audio_sink_track(callback=st.session_state["recorder"].add_sound,
+                                                 key="interview-sound")
 
         stream = webrtc_streamer(
             key="interview",
             mode=WebRtcMode.SENDRECV,
-            video_processor_factory=lambda: InterviewProcessor(gallery, recording_path),
-            # ask for about 640 x 480 (phones and laptops pick their nearest size)
+            video_processor_factory=lambda: InterviewProcessor(gallery, recorder, with_sound),
+            sink_audio_track=sound_sink,
+            # ask for about 640 x 480 (phones and laptops pick their nearest size), and the microphone if needed
             media_stream_constraints={"video": {"width": {"ideal": 640}, "height": {"ideal": 480}},
-                                      "audio": False},
+                                      "audio": with_sound},
             rtc_configuration=rtc_configuration,
             async_processing=True,                # drop frames instead of lagging behind when busy
             # how the video and its buttons look ("Switch camera" picks e.g. a phone's back camera)
@@ -668,6 +808,8 @@ def live_interview(gallery, rtc_configuration):
             st.markdown("- Both people face the camera for the first few seconds, so they are recognised.\n"
                         "- Sit within about 2 metres of the camera, in good light.\n"
                         "- On a phone, use **Switch camera** to film with the back camera.\n"
+                        "- Allow the microphone as well as the camera. The sound is recorded, but not played "
+                        "back during the interview, so there is no echo.\n"
                         "- The recording starts with the first processed frame, and appears below "
                         "when you press **Stop interview**.")
     return stream, recording_path

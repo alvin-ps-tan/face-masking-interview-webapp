@@ -60,7 +60,10 @@ when a video connection attempt fails or is closed — a sign the TURN login is 
    phone's back camera). The interviewee is pixelated and named *Mr. X*; reporters are named in green; anyone
    else is a masked *Stranger*. Press **Stop interview** to end.
 3. If *Record this interview* was on, the processed interview appears below the video, with a download
-   button. The recording starts with the first processed frame.
+   button. The recording starts with the first processed frame. With *Record the sound too* on, the browser
+   also asks for the microphone, and the interview's sound is saved in the same MP4. The sound is not played
+   back during the interview, so there is no echo. (Blocking the microphone also blocks the camera, because
+   the browser asks for both together. Turn the sound off to record video only.)
 
 The app's colours come from `.streamlit/config.toml` (one line: the colour of buttons and highlights).
 
