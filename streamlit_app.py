@@ -32,8 +32,6 @@ import streamlit as st
 from scipy import spatial
 from streamlit_webrtc import VideoProcessorBase, WebRtcMode, get_cloudflare_ice_servers, webrtc_streamer
 
-from connection_check import check_video_connection     # the troubleshooting check (connection_check.py)
-
 # ---- files (all paths are relative to this script, so the app runs from any folder)
 APP_FOLDER = os.path.dirname(os.path.abspath(__file__))
 REPORTER_DIR = os.path.join(APP_FOLDER, "data", "reporter_enrolment")
@@ -492,7 +490,7 @@ class InterviewProcessor(VideoProcessorBase):
 # Enrolment: the reporters from the repository, the interviewee from the camera
 # =====================================================================================================
 
-@st.cache_resource                               # build the reporter gallery once, not on every click
+@st.cache_resource(show_spinner="Loading the reporters' faces...")   # build the gallery once, not on every click
 def load_reporter_gallery():
     """One entry per reporter photo in data/reporter_enrolment/<Name>/ -- the folder name is the label."""
     face_detector = new_face_detector()
@@ -514,7 +512,7 @@ def load_reporter_gallery():
     return gallery
 
 
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def load_photo_models():
     """A detector and a face model for the interviewee's photo (the live video has its own copies)."""
     return new_face_detector(), new_face_model()
@@ -588,68 +586,125 @@ def video_relay_settings():
     return {"iceServers": servers}, True, "TURN relay from " + source + ": " + turn_addresses[0]
 
 
-def main():
-    st.set_page_config(page_title="Interview Face Masking", layout="centered")
-    st.title("Live interview with face masking")
-    st.caption("Week 11 sample project: MediaPipe finds the faces, MobileFaceNet recognises them, "
-               "and the interviewee is pixelated in every frame.")
+def show_reporters(reporter_gallery):
+    """The reporters the app knows (from the repository), folded away in an expander."""
+    names = []
+    for entry in reporter_gallery:
+        if entry["person"] not in names:
+            names.append(entry["person"])
+    with st.expander("Reporters known to the app (" + str(len(names)) + ")", icon=":material/badge:"):
+        st.write(", ".join(names))
+        st.caption("To add a reporter, add a folder data/reporter_enrolment/<Name>/ with a clear, "
+                   "front-facing photo of them.")
 
-    # ---- how the live video will connect (also written to the app's logs, once per visitor)
+
+def photograph_interviewee():
+    """STEP 1: take the interviewee's photo. Returns their face template, or None if there is none yet."""
+    with st.container(border=True):
+        st.subheader("1. Photograph the interviewee")
+        st.write("Ask the interviewee to look straight at the camera, in good light, and take the photo. "
+                 "Only their face template is kept, for this browser session; the photo is never saved.")
+
+        camera_column, result_column = st.columns([3, 2], vertical_alignment="center")
+        with camera_column:
+            photo = st.camera_input("Interviewee photo", label_visibility="collapsed")
+
+        with result_column:
+            if photo is None:
+                st.info("No photo yet.", icon=":material/photo_camera:")
+                return None
+
+            # the photo arrives as JPEG bytes: decode them into an OpenCV (BGR) image
+            photo_bytes = np.frombuffer(photo.getvalue(), dtype=np.uint8)
+            bgr = cv2.imdecode(photo_bytes, cv2.IMREAD_COLOR)
+
+            face_detector, face_model = load_photo_models()
+            boxes = detect_faces(bgr, face_detector)
+            if len(boxes) == 0:
+                st.error("No face found. Please retake the photo, facing the camera.", icon=":material/error:")
+                return None
+            if len(boxes) > 1:
+                st.warning("More than one face: the biggest one is used.", icon=":material/warning:")
+
+            interviewee_crop = crop_face(bgr, biggest_face(boxes))         # 112 x 112 RGB
+            st.image(interviewee_crop, width=140)
+            st.success("Enrolled as **" + INTERVIEWEE_ALIAS + "**: masked in the video.",
+                       icon=":material/check_circle:")
+            return make_template(interviewee_crop, face_model)
+
+
+def live_interview(gallery, rtc_configuration):
+    """STEP 2: the live interview. Returns (the video stream, the recording's file path or None)."""
+    with st.container(border=True):
+        st.subheader("2. Live interview")
+        st.markdown("Names on screen: :green[**reporter**] · :orange[**" + INTERVIEWEE_ALIAS + "** (masked)] · "
+                    ":red[**Stranger** (masked)]")
+        record = st.toggle("Record this interview", value=True)
+
+        # every browser session records to its own file, so two people never overwrite each other's video
+        if "session_id" not in st.session_state:
+            st.session_state["session_id"] = uuid.uuid4().hex[:8]
+        os.makedirs(RECORDING_DIR, exist_ok=True)
+        recording_path = os.path.join(RECORDING_DIR, "interview_" + st.session_state["session_id"] + ".mp4")
+        if not record:
+            recording_path = None
+
+        stream = webrtc_streamer(
+            key="interview",
+            mode=WebRtcMode.SENDRECV,
+            video_processor_factory=lambda: InterviewProcessor(gallery, recording_path),
+            # ask for about 640 x 480 (phones and laptops pick their nearest size)
+            media_stream_constraints={"video": {"width": {"ideal": 640}, "height": {"ideal": 480}},
+                                      "audio": False},
+            rtc_configuration=rtc_configuration,
+            async_processing=True,                # drop frames instead of lagging behind when busy
+            # how the video and its buttons look ("Switch camera" picks e.g. a phone's back camera)
+            video_html_attrs={"autoPlay": True, "controls": False, "playsInline": True, "muted": True,
+                              "style": {"width": "100%", "borderRadius": "8px"}},
+            translations={"start": "Start interview", "stop": "Stop interview", "select_device": "Switch camera"},
+        )
+
+        with st.expander("Tips for a good interview", icon=":material/lightbulb:"):
+            st.markdown("- Both people face the camera for the first few seconds, so they are recognised.\n"
+                        "- Sit within about 2 metres of the camera, in good light.\n"
+                        "- On a phone, use **Switch camera** to film with the back camera.\n"
+                        "- The recording starts with the first processed frame, and appears below "
+                        "when you press **Stop interview**.")
+    return stream, recording_path
+
+
+def show_recording(recording_path):
+    """STEP 3: play the recorded interview, with a download button."""
+    with st.container(border=True):
+        st.subheader("3. Your recording")
+        with open(recording_path, "rb") as video_file:
+            video_bytes = video_file.read()
+        st.video(video_bytes)
+        st.download_button("Download the masked interview (MP4)", video_bytes, file_name="masked_interview.mp4",
+                           mime="video/mp4", type="primary", icon=":material/download:", width="stretch")
+
+
+def main():
+    st.set_page_config(page_title="Masked Interview", page_icon="🎥", layout="centered")
+    st.title("Masked interview")
+    st.write("Film an interview in which the **interviewee can never be identified**, while every face on "
+             "screen is still named.")
+
+    # ---- how the live video will connect (written to the app's logs once per visitor; shown only if broken)
     rtc_configuration, relay_ok, relay_message = video_relay_settings()
     if "relay_logged" not in st.session_state:
         print("[video connection]", relay_message, flush=True)
         st.session_state["relay_logged"] = True
-
-    # ---- troubleshooting, in the sidebar: can THIS server reach the STUN and TURN servers?
-    with st.sidebar:
-        st.subheader("Troubleshooting")
-        st.write("If the live video keeps *connecting* and never starts, check whether this server can "
-                 "reach the video relay servers.")
-        st.caption("Video connection: " + relay_message)
-        if st.button("Check the video connection"):
-            with st.spinner("Checking (up to 10 s per address)..."):
-                results = check_video_connection(rtc_configuration["iceServers"])
-            for ok, message in results:
-                print("[connection check]", "OK  " if ok else "FAIL", message, flush=True)
-                if ok:
-                    st.success(message)
-                else:
-                    st.error(message)
+    if not relay_ok:
+        st.error("Live video: " + relay_message, icon=":material/error:")
 
     reporter_gallery = load_reporter_gallery()
-    reporter_names = []
-    for entry in reporter_gallery:
-        reporter_names.append(entry["person"])
-    st.write(f"**Reporters** loaded from the repository: {len(reporter_gallery)} photos "
-             f"({', '.join(reporter_names)})")
+    show_reporters(reporter_gallery)
 
-    # ---- STEP A: the interviewee's photo, taken with the camera and kept only in memory
-    st.header("1. Photograph the interviewee")
-    st.write("Ask the interviewee to look straight at the camera, then take the photo. "
-             "Only their face template is kept, in this browser session; nothing is saved to disk.")
-    photo = st.camera_input("Interviewee photo")
-
-    if photo is not None:
-        # the photo arrives as JPEG bytes: decode them into an OpenCV (BGR) image
-        photo_bytes = np.frombuffer(photo.getvalue(), dtype=np.uint8)
-        bgr = cv2.imdecode(photo_bytes, cv2.IMREAD_COLOR)
-
-        face_detector, face_model = load_photo_models()
-        boxes = detect_faces(bgr, face_detector)
-        if len(boxes) == 0:
-            st.error("No face found in the photo. Please take it again, facing the camera.")
-            st.session_state.pop("interviewee_template", None)
-        else:
-            if len(boxes) > 1:
-                st.warning("More than one face in the photo: the biggest one is used as the interviewee.")
-            interviewee_crop = crop_face(bgr, biggest_face(boxes))         # 112 x 112 RGB
-            st.session_state["interviewee_template"] = make_template(interviewee_crop, face_model)
-            st.image(interviewee_crop, caption=f"The interviewee's face, shown as {INTERVIEWEE_ALIAS}", width=150)
-    else:
-        st.session_state.pop("interviewee_template", None)
-
-    if "interviewee_template" not in st.session_state:
-        st.info("Take the interviewee's photo to continue.")
+    # ---- STEP 1: the interviewee's photo
+    interviewee_template = photograph_interviewee()
+    if interviewee_template is None:
+        st.caption("The live interview appears here once the interviewee's photo is taken.")
         return
 
     # the gallery for the live interview: every reporter, plus the interviewee
@@ -657,49 +712,18 @@ def main():
     for entry in reporter_gallery:
         gallery.append(entry)
     gallery.append({"person": "interviewee", "role": "interviewee", "label": INTERVIEWEE_ALIAS,
-                    "template": st.session_state["interviewee_template"]})
+                    "template": interviewee_template})
 
-    # ---- STEP B: the live interview
-    st.header("2. Live interview")
-    record = st.checkbox("Record the processed interview to an MP4 file", value=True)
-    st.write("Press **START** and allow the camera. The interviewee is masked and every face is named. "
-             "Press **STOP** to end the interview. The recording starts with the first processed frame.")
+    # ---- STEP 2: the live interview
+    stream, recording_path = live_interview(gallery, rtc_configuration)
 
-    # every browser session records to its own file, so two people using the app never overwrite each other
-    if "session_id" not in st.session_state:
-        st.session_state["session_id"] = uuid.uuid4().hex[:8]
-    os.makedirs(RECORDING_DIR, exist_ok=True)
-    recording_path = os.path.join(RECORDING_DIR, "interview_" + st.session_state["session_id"] + ".mp4")
-    if record:
-        path_for_processor = recording_path
-    else:
-        path_for_processor = None
-
-    if relay_ok:
-        st.caption("Video connection: " + relay_message)
-    else:
-        st.error("Video connection: " + relay_message)
-
-    stream = webrtc_streamer(
-        key="interview",
-        mode=WebRtcMode.SENDRECV,
-        video_processor_factory=lambda: InterviewProcessor(gallery, path_for_processor),
-        # ask for about 640 x 480 (phones and laptops pick their nearest size); "SELECT DEVICE" under the
-        # video lets the user switch between cameras, e.g. a phone's front and back camera
-        media_stream_constraints={"video": {"width": {"ideal": 640}, "height": {"ideal": 480}}, "audio": False},
-        rtc_configuration=rtc_configuration,
-        async_processing=True,                    # drop frames instead of lagging behind when busy
-    )
-
-    # ---- STEP C: the recording, once an interview has been recorded and stopped
+    # ---- STEP 3: the recording, once an interview has been recorded and stopped
     interview_running = stream.state.playing
-    if record and not interview_running and os.path.exists(recording_path):
-        st.header("3. The recorded interview")
-        with open(recording_path, "rb") as video_file:
-            video_bytes = video_file.read()
-        st.video(video_bytes)
-        st.download_button("Download the interview (MP4)", video_bytes,
-                           file_name="masked_interview.mp4", mime="video/mp4")
+    if recording_path is not None and not interview_running and os.path.exists(recording_path):
+        show_recording(recording_path)
+
+    st.caption("Week 11 sample project · MediaPipe finds the faces, MobileFaceNet recognises them, "
+               "and the interviewee is pixelated in every frame.")
 
 
 if __name__ == "__main__":

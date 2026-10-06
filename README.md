@@ -45,25 +45,24 @@ camera on `https://` pages. Deploy (below) to use phones.
      (Already deployed? Open the app's **⋮ → Settings → Secrets**, paste it, and save: the app restarts.)
 4. **Deploy.** The first start takes a few minutes while the packages install. Open the app's
    `https://...streamlit.app` address on a laptop or a phone, and allow the camera when the browser asks.
-   The sidebar says which video connection the app uses: it should name your TURN server, not "STUN only".
 
-**If the video still will not connect**, press **Check the video connection** in the sidebar. The server then
-tries every STUN and TURN address in its settings and shows (and writes to the logs) which ones work — for
-example a wrong TURN login, or a TURN address the cloud cannot reach.
-
-In the cloud logs, lines with `gl_context ... eglMakeCurrent` are harmless (MediaPipe looks for a graphics
-card, finds none, and uses the CPU). Lines with `aioice ... Transaction.__retry` appear when a video
-connection attempt fails or is closed — a sign the TURN server is missing or wrong.
+**If the live video keeps "connecting" and never starts**, check the app's logs (**Manage app** at the bottom
+right of the app). Each visitor adds a `[video connection]` line saying which relay the app uses: it should
+name your TURN server, not "STUN only". Lines with `gl_context ... eglMakeCurrent` are harmless (MediaPipe
+looks for a graphics card, finds none, and uses the CPU). Lines with `aioice ... Transaction.__retry` appear
+when a video connection attempt fails or is closed — a sign the TURN login is missing or wrong.
 
 ## Using the app
 
-1. **Photograph the interviewee**: they look straight at the camera, you press *Take photo*. Only their face
-   template is kept, in memory, for this browser session.
-2. **Live interview**: press **START**. Use **SELECT DEVICE** to switch camera (for example a phone's back
-   camera). The interviewee is pixelated and shown as *Mr. X*; reporters are named; anyone else is a masked
-   *Stranger*. Press **STOP** to end.
-3. If *Record* was ticked, the processed interview appears below the video, with a download button. The
-   recording starts with the first processed frame.
+1. **Photograph the interviewee**: they look straight at the camera, you press *Take photo*. Their face crop
+   appears with *Enrolled as Mr. X*. Only their face template is kept, in memory, for this browser session.
+2. **Live interview**: press **Start interview**. Use **Switch camera** to change camera (for example a
+   phone's back camera). The interviewee is pixelated and named *Mr. X*; reporters are named in green; anyone
+   else is a masked *Stranger*. Press **Stop interview** to end.
+3. If *Record this interview* was on, the processed interview appears below the video, with a download
+   button. The recording starts with the first processed frame.
+
+The app's colours come from `.streamlit/config.toml` (one line: the colour of buttons and highlights).
 
 ## Good to know
 
