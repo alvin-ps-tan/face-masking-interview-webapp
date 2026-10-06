@@ -154,6 +154,18 @@ def rectangle_around_face(box, image):
     return x, y, x1, y1
 
 
+def touches_edge(box, image):
+    """True if MediaPipe's face box reaches the edge of the picture: part of the face may be cut off.
+    (detect_faces keeps every box inside the picture, so a face sticking out ends exactly at the edge.)"""
+    image_height, image_width = image.shape[:2]
+    x, y, w, h = box
+    if x <= 0 or y <= 0:
+        return True                               # at the left or top edge
+    if x + w >= image_width or y + h >= image_height:
+        return True                               # at the right or bottom edge
+    return False
+
+
 def crop_face(bgr, box):
     """Cut the face rectangle, and resize it to 112 x 112 RGB for MobileFaceNet."""
     x, y, x1, y1 = rectangle_around_face(box, bgr)
@@ -536,6 +548,7 @@ class InterviewProcessor(VideoProcessorBase):
 
         # ---- STEP 3: DETECT faces. For each box: an old face, a labelled person who moved fast, or a new face?
         detected_boxes = detect_faces(frame, self.face_detector)
+        edge_boxes = []                           # new faces cut off by the edge of the picture in this frame
         for box in detected_boxes:
             # which face from the previous frame does this box overlap the most?
             best_iou = 0.0
@@ -559,6 +572,12 @@ class InterviewProcessor(VideoProcessorBase):
 
             # the reporter AND the interviewee are both labelled: never use the face model for anyone else
             if both_people_labelled(faces):
+                continue
+
+            # a NEW face, but cut off by the edge of the picture: wait until it is fully inside before
+            # recognising it (until then it is only masked, in step 7)
+            if touches_edge(box, frame):
+                edge_boxes.append(box)
                 continue
 
             # a NEW face: crop it and recognise it, 1:N then 1:1
@@ -605,6 +624,9 @@ class InterviewProcessor(VideoProcessorBase):
                 pixelate_face(frame, face["box"])
             if face["role"] == "stranger" and MASK_STRANGERS:
                 pixelate_face(frame, face["box"])
+        for box in edge_boxes:                    # not recognised yet: when unsure, hide the face (no name)
+            if MASK_STRANGERS:
+                pixelate_face(frame, box)
         for face in faces:
             draw_label(frame, face)
         return frame
