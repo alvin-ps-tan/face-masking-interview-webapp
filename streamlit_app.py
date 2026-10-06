@@ -518,19 +518,29 @@ def load_photo_models():
     return new_face_detector(), new_face_model()
 
 
-def ice_servers():
-    """The servers that help the browser's video reach this app (WebRTC).
+def video_relay_settings():
+    """How the browser's video reaches this app (WebRTC). Returns (rtc_configuration, description).
+
     On your own computer the free Google STUN server is enough. On Streamlit Cloud the app sits behind a
-    firewall, so the video must be relayed by a TURN server -- its login comes from the app's Secrets."""
-    servers = [{"urls": ["stun:stun.l.google.com:19302"]}]
+    firewall, so the video must be relayed by a TURN server. Two ways to give the app a TURN server,
+    both through the app's Secrets (see README.md):
+      1. a [turn] section with the login of any TURN service (see secrets_example.toml);
+      2. HF_TOKEN = "hf_..." (a free Hugging Face token) -- or Cloudflare / Twilio keys. For these,
+         we pass no settings at all, and streamlit-webrtc finds the token itself and fetches a TURN login.
+    """
     try:
-        turn = st.secrets["turn"]                 # the [turn] section of the Secrets (see README.md)
-        servers.append({"urls": list(turn["urls"]),
-                        "username": turn["username"],
-                        "credential": turn["credential"]})
+        turn = st.secrets["turn"]                 # the [turn] section of the Secrets
+        servers = [{"urls": ["stun:stun.l.google.com:19302"]},
+                   {"urls": list(turn["urls"]), "username": turn["username"], "credential": turn["credential"]}]
+        return {"iceServers": servers}, "TURN server from the [turn] Secrets"
     except Exception:
-        pass                                      # no Secrets (e.g. running locally): STUN only
-    return servers
+        pass                                      # no [turn] section
+
+    # no [turn] section: let streamlit-webrtc choose (HF_TOKEN, Cloudflare or Twilio Secrets, else STUN only)
+    for name in ("HF_TOKEN", "CLOUDFLARE_TURN_KEY_ID", "TWILIO_ACCOUNT_SID"):
+        if os.environ.get(name):
+            return None, "TURN server found automatically (" + name + ")"
+    return None, "STUN only -- fine on your own computer, but on Streamlit Cloud add a TURN server (README.md)"
 
 
 def main():
@@ -598,6 +608,9 @@ def main():
     else:
         path_for_processor = None
 
+    rtc_configuration, relay_description = video_relay_settings()
+    st.caption("Video connection: " + relay_description)
+
     stream = webrtc_streamer(
         key="interview",
         mode=WebRtcMode.SENDRECV,
@@ -605,7 +618,7 @@ def main():
         # ask for about 640 x 480 (phones and laptops pick their nearest size); "SELECT DEVICE" under the
         # video lets the user switch between cameras, e.g. a phone's front and back camera
         media_stream_constraints={"video": {"width": {"ideal": 640}, "height": {"ideal": 480}}, "audio": False},
-        rtc_configuration={"iceServers": ice_servers()},
+        rtc_configuration=rtc_configuration,
         async_processing=True,                    # drop frames instead of lagging behind when busy
     )
 

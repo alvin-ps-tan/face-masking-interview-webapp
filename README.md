@@ -29,16 +29,24 @@ camera on `https://` pages. Deploy (below) to use phones.
 
 1. **Push this folder to GitHub.** Only this folder is needed. Do **not** push `../models/resnet100_glint360/`
    (261 MB — GitHub refuses files over 100 MB); this app does not use it.
-2. **Get a free TURN server login.** On the cloud, the live video has to be relayed by a TURN server.
-   Sign up for a free TURN service (for example Metered, or Twilio), create a TURN credential, and note its
-   server URLs, username and password.
+2. **Get a free TURN server login.** On the cloud, the live video has to be relayed by a TURN server —
+   without one the video keeps "connecting" and never starts. The easiest free option is a **Hugging Face
+   access token**: sign up at huggingface.co → *Settings → Access Tokens → Create new token* (type *Read*).
+   `secrets_example.toml` also shows the Cloudflare option and the format for any other TURN service.
 3. On [share.streamlit.io](https://share.streamlit.io), **Create app** and choose:
    - the repository and branch;
-   - **Main file path**: `week_11_project_specifications_walkthrough/sample_project/streamlit/streamlit_app.py`;
-   - **Advanced settings → Python version: 3.10**;
-   - **Advanced settings → Secrets**: paste the text of `secrets_example.toml`, with your own TURN values.
+   - **Main file path**: `streamlit_app.py` (the path of this file inside your repository);
+   - **Advanced settings → Python version: 3.10 or 3.11**;
+   - **Advanced settings → Secrets**: one of the options in `secrets_example.toml`, e.g. `HF_TOKEN = "hf_..."`.
+     (Already deployed? Open the app's **⋮ → Settings → Secrets**, paste it, and save: the app restarts.)
 4. **Deploy.** The first start takes a few minutes while the packages install. Open the app's
    `https://...streamlit.app` address on a laptop or a phone, and allow the camera when the browser asks.
+   Under *2. Live interview* the app says which video connection it uses: it should name your TURN server,
+   not "STUN only".
+
+In the cloud logs, lines with `gl_context ... eglMakeCurrent` are harmless (MediaPipe looks for a graphics
+card, finds none, and uses the CPU). Lines with `aioice ... Transaction.__retry` appear when a video
+connection attempt fails or is closed — a sign the TURN server is missing or wrong.
 
 ## Using the app
 
