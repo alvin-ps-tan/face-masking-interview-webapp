@@ -30,7 +30,8 @@ import mediapipe as mp
 import numpy as np
 import streamlit as st
 from scipy import spatial
-from streamlit_webrtc import VideoProcessorBase, WebRtcMode, webrtc_streamer
+from streamlit_webrtc import (VideoProcessorBase, WebRtcMode, get_cloudflare_ice_servers, get_hf_ice_servers,
+                              webrtc_streamer)
 
 # ---- files (all paths are relative to this script, so the app runs from any folder)
 APP_FOLDER = os.path.dirname(os.path.abspath(__file__))
@@ -518,29 +519,73 @@ def load_photo_models():
     return new_face_detector(), new_face_model()
 
 
+def read_secret(name):
+    """A value from the app's Secrets, or None if it is not there (for example when running locally)."""
+    try:
+        return st.secrets[name]
+    except Exception:
+        return None
+
+
+def with_tcp_versions(servers):
+    """Add a TCP version of every TURN address: firewalls often block UDP traffic but let TCP through."""
+    result = []
+    for server in servers:
+        urls = server["urls"]
+        if isinstance(urls, str):                 # one address, or a list of addresses
+            urls = [urls]
+        all_urls = []
+        for url in urls:
+            all_urls.append(url)
+            if url.startswith("turn:") and "transport=" not in url:
+                all_urls.append(url + "?transport=tcp")
+        new_server = dict(server)
+        new_server["urls"] = all_urls
+        result.append(new_server)
+    return result
+
+
 def video_relay_settings():
-    """How the browser's video reaches this app (WebRTC). Returns (rtc_configuration, description).
+    """How the browser's video reaches this app (WebRTC). Returns (rtc_configuration, ok, message).
 
     On your own computer the free Google STUN server is enough. On Streamlit Cloud the app sits behind a
-    firewall, so the video must be relayed by a TURN server. Two ways to give the app a TURN server,
-    both through the app's Secrets (see README.md):
-      1. a [turn] section with the login of any TURN service (see secrets_example.toml);
-      2. HF_TOKEN = "hf_..." (a free Hugging Face token) -- or Cloudflare / Twilio keys. For these,
-         we pass no settings at all, and streamlit-webrtc finds the token itself and fetches a TURN login.
+    firewall, so the video must be relayed by a TURN server. Its login comes from the app's Secrets
+    (see secrets_example.toml), in one of three forms:
+      1. HF_TOKEN = "hf_..."  -- a free Hugging Face token; we ask Hugging Face for a TURN login;
+      2. CLOUDFLARE_TURN_KEY_ID and CLOUDFLARE_TURN_KEY_API_TOKEN -- Cloudflare's TURN service;
+      3. a [turn] section with the login of any other TURN service.
     """
-    try:
-        turn = st.secrets["turn"]                 # the [turn] section of the Secrets
-        servers = [{"urls": ["stun:stun.l.google.com:19302"]},
-                   {"urls": list(turn["urls"]), "username": turn["username"], "credential": turn["credential"]}]
-        return {"iceServers": servers}, "TURN server from the [turn] Secrets"
-    except Exception:
-        pass                                      # no [turn] section
+    servers = [{"urls": ["stun:stun.l.google.com:19302"]}]
+    turn = read_secret("turn")
+    hf_token = read_secret("HF_TOKEN")
+    cloudflare_id = read_secret("CLOUDFLARE_TURN_KEY_ID")
+    cloudflare_token = read_secret("CLOUDFLARE_TURN_KEY_API_TOKEN")
 
-    # no [turn] section: let streamlit-webrtc choose (HF_TOKEN, Cloudflare or Twilio Secrets, else STUN only)
-    for name in ("HF_TOKEN", "CLOUDFLARE_TURN_KEY_ID", "TWILIO_ACCOUNT_SID"):
-        if os.environ.get(name):
-            return None, "TURN server found automatically (" + name + ")"
-    return None, "STUN only -- fine on your own computer, but on Streamlit Cloud add a TURN server (README.md)"
+    try:
+        if hf_token:
+            servers = servers + get_hf_ice_servers(hf_token)
+            source = "Hugging Face (HF_TOKEN)"
+        elif cloudflare_id and cloudflare_token:
+            servers = servers + get_cloudflare_ice_servers(cloudflare_id, cloudflare_token)
+            source = "Cloudflare"
+        elif turn is not None:
+            servers.append({"urls": list(turn["urls"]), "username": turn["username"],
+                            "credential": turn["credential"]})
+            source = "the [turn] Secrets"
+        else:
+            return ({"iceServers": servers}, True,
+                    "STUN only -- fine on your own computer; on Streamlit Cloud add a TURN server (README.md).")
+    except Exception as error:
+        return ({"iceServers": servers}, False,
+                "Could not get a TURN login: " + str(error) + " -- check the app's Secrets.")
+
+    servers = with_tcp_versions(servers)
+    turn_addresses = []
+    for server in servers:
+        for url in server["urls"]:
+            if url.startswith("turn"):
+                turn_addresses.append(url.split("?")[0])
+    return {"iceServers": servers}, True, "TURN relay from " + source + ": " + turn_addresses[0]
 
 
 def main():
@@ -608,8 +653,11 @@ def main():
     else:
         path_for_processor = None
 
-    rtc_configuration, relay_description = video_relay_settings()
-    st.caption("Video connection: " + relay_description)
+    rtc_configuration, relay_ok, relay_message = video_relay_settings()
+    if relay_ok:
+        st.caption("Video connection: " + relay_message)
+    else:
+        st.error("Video connection: " + relay_message)
 
     stream = webrtc_streamer(
         key="interview",
