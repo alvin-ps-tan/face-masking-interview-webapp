@@ -1,0 +1,7 @@
+# interview videos recorded by the app -- never commit them
+recordings/
+
+# your real TURN login -- keep it out of git (paste it into the app's Secrets on Streamlit Cloud instead)
+.streamlit/secrets.toml
+
+__pycache__/

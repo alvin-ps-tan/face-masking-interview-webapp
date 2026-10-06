@@ -1,0 +1,12 @@
+# Python packages for streamlit_app.py -- tested together with Python 3.10.
+# Streamlit Community Cloud installs these automatically (choose Python 3.10 when you deploy).
+# On your own computer:   pip install -r requirements.txt
+streamlit==1.60.0
+streamlit-webrtc==0.78.1          # live camera video in the browser
+aiortc==1.15.0                    # the video connection used by streamlit-webrtc
+av==17.1.0                        # video frames, and the MP4 recording
+mediapipe==0.10.9                 # face detection
+protobuf==3.20.3                  # the version mediapipe 0.10.9 needs
+numpy==1.23.5
+opencv-contrib-python==4.8.1.78   # video, drawing, and the MobileFaceNet model (cv2.dnn)
+scipy==1.15.3
