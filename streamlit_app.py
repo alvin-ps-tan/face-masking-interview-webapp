@@ -30,8 +30,9 @@ import mediapipe as mp
 import numpy as np
 import streamlit as st
 from scipy import spatial
-from streamlit_webrtc import (VideoProcessorBase, WebRtcMode, get_cloudflare_ice_servers, get_hf_ice_servers,
-                              webrtc_streamer)
+from streamlit_webrtc import VideoProcessorBase, WebRtcMode, get_cloudflare_ice_servers, webrtc_streamer
+
+from connection_check import check_video_connection     # the troubleshooting check (connection_check.py)
 
 # ---- files (all paths are relative to this script, so the app runs from any folder)
 APP_FOLDER = os.path.dirname(os.path.abspath(__file__))
@@ -550,23 +551,22 @@ def video_relay_settings():
 
     On your own computer the free Google STUN server is enough. On Streamlit Cloud the app sits behind a
     firewall, so the video must be relayed by a TURN server. Its login comes from the app's Secrets
-    (see secrets_example.toml), in one of three forms:
-      1. HF_TOKEN = "hf_..."  -- a free Hugging Face token; we ask Hugging Face for a TURN login;
-      2. CLOUDFLARE_TURN_KEY_ID and CLOUDFLARE_TURN_KEY_API_TOKEN -- Cloudflare's TURN service;
-      3. a [turn] section with the login of any other TURN service.
+    (see secrets_example.toml), in one of two forms:
+      1. CLOUDFLARE_TURN_KEY_ID and CLOUDFLARE_TURN_KEY_API_TOKEN -- Cloudflare's TURN service (free tier);
+         we ask Cloudflare for a fresh TURN login each time;
+      2. a [turn] section with the fixed login of any other TURN service.
     """
     servers = [{"urls": ["stun:stun.l.google.com:19302"]}]
     turn = read_secret("turn")
-    hf_token = read_secret("HF_TOKEN")
     cloudflare_id = read_secret("CLOUDFLARE_TURN_KEY_ID")
     cloudflare_token = read_secret("CLOUDFLARE_TURN_KEY_API_TOKEN")
 
     try:
-        if hf_token:
-            servers = servers + get_hf_ice_servers(hf_token)
-            source = "Hugging Face (HF_TOKEN)"
-        elif cloudflare_id and cloudflare_token:
-            servers = servers + get_cloudflare_ice_servers(cloudflare_id, cloudflare_token)
+        if cloudflare_id and cloudflare_token:
+            cloudflare_servers = get_cloudflare_ice_servers(cloudflare_id, cloudflare_token)
+            if isinstance(cloudflare_servers, dict):      # one server, or a list of servers
+                cloudflare_servers = [cloudflare_servers]
+            servers = servers + cloudflare_servers
             source = "Cloudflare"
         elif turn is not None:
             servers.append({"urls": list(turn["urls"]), "username": turn["username"],
@@ -593,6 +593,28 @@ def main():
     st.title("Live interview with face masking")
     st.caption("Week 11 sample project: MediaPipe finds the faces, MobileFaceNet recognises them, "
                "and the interviewee is pixelated in every frame.")
+
+    # ---- how the live video will connect (also written to the app's logs, once per visitor)
+    rtc_configuration, relay_ok, relay_message = video_relay_settings()
+    if "relay_logged" not in st.session_state:
+        print("[video connection]", relay_message, flush=True)
+        st.session_state["relay_logged"] = True
+
+    # ---- troubleshooting, in the sidebar: can THIS server reach the STUN and TURN servers?
+    with st.sidebar:
+        st.subheader("Troubleshooting")
+        st.write("If the live video keeps *connecting* and never starts, check whether this server can "
+                 "reach the video relay servers.")
+        st.caption("Video connection: " + relay_message)
+        if st.button("Check the video connection"):
+            with st.spinner("Checking (up to 10 s per address)..."):
+                results = check_video_connection(rtc_configuration["iceServers"])
+            for ok, message in results:
+                print("[connection check]", "OK  " if ok else "FAIL", message, flush=True)
+                if ok:
+                    st.success(message)
+                else:
+                    st.error(message)
 
     reporter_gallery = load_reporter_gallery()
     reporter_names = []
@@ -653,7 +675,6 @@ def main():
     else:
         path_for_processor = None
 
-    rtc_configuration, relay_ok, relay_message = video_relay_settings()
     if relay_ok:
         st.caption("Video connection: " + relay_message)
     else:

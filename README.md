@@ -30,19 +30,26 @@ camera on `https://` pages. Deploy (below) to use phones.
 1. **Push this folder to GitHub.** Only this folder is needed. Do **not** push `../models/resnet100_glint360/`
    (261 MB — GitHub refuses files over 100 MB); this app does not use it.
 2. **Get a free TURN server login.** On the cloud, the live video has to be relayed by a TURN server —
-   without one the video keeps "connecting" and never starts. The easiest free option is a **Hugging Face
-   access token**: sign up at huggingface.co → *Settings → Access Tokens → Create new token* (type *Read*).
-   `secrets_example.toml` also shows the Cloudflare option and the format for any other TURN service.
+   without one the video keeps "connecting" and never starts. Without a payment method: sign up at
+   **expressturn.com** with an email (free plan: 1,000 GB a month) and copy the server address, username
+   and password from its dashboard. (Cloudflare's TURN service also works, but needs a payment method on
+   the Cloudflare account.) `secrets_example.toml` shows where the values go. (The Hugging Face TURN option
+   built into `streamlit-webrtc` no longer works: its login service is down and its TURN server address no
+   longer exists.)
 3. On [share.streamlit.io](https://share.streamlit.io), **Create app** and choose:
    - the repository and branch;
    - **Main file path**: `streamlit_app.py` (the path of this file inside your repository);
    - **Advanced settings → Python version: 3.10 or 3.11**;
-   - **Advanced settings → Secrets**: one of the options in `secrets_example.toml`, e.g. `HF_TOKEN = "hf_..."`.
+   - **Advanced settings → Secrets**: one of the options in `secrets_example.toml` (e.g. the `[turn]` section
+     with your ExpressTURN address, username and password).
      (Already deployed? Open the app's **⋮ → Settings → Secrets**, paste it, and save: the app restarts.)
 4. **Deploy.** The first start takes a few minutes while the packages install. Open the app's
    `https://...streamlit.app` address on a laptop or a phone, and allow the camera when the browser asks.
-   Under *2. Live interview* the app says which video connection it uses: it should name your TURN server,
-   not "STUN only".
+   The sidebar says which video connection the app uses: it should name your TURN server, not "STUN only".
+
+**If the video still will not connect**, press **Check the video connection** in the sidebar. The server then
+tries every STUN and TURN address in its settings and shows (and writes to the logs) which ones work — for
+example a wrong TURN login, or a TURN address the cloud cannot reach.
 
 In the cloud logs, lines with `gl_context ... eglMakeCurrent` are harmless (MediaPipe looks for a graphics
 card, finds none, and uses the CPU). Lines with `aioice ... Transaction.__retry` appear when a video
